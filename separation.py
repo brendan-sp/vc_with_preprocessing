@@ -96,18 +96,25 @@ def separate_roformer(
     instrumental_out: Path,
     device: Optional[str] = None,
 ) -> Tuple[Path, Path]:
-    """Separate using MelBandRoformer."""
-    from roformer_separation.model import MelBandRoformer
-    from roformer_separation.config import load_config_from_yaml
-    from roformer_separation.inference import demix, prefer_target_instrument
-    from roformer_separation.download import get_model_paths
+    """Separate using MelBandRoformer via mel_band_roformer package."""
+    from mel_band_roformer import MODEL_REGISTRY, demix_track
+    from mel_band_roformer.download import download_model_assets, DATA_ROOT
+    from mel_band_roformer.inference import get_model_from_config
+    import yaml
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_path, config_path = get_model_paths("vocals")
-    config = load_config_from_yaml(str(config_path))
 
-    model = MelBandRoformer(**vars(config.model))
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    model_entry = MODEL_REGISTRY.get("melband-roformer-kim-vocals")
+    download_model_assets([model_entry], DATA_ROOT)
+
+    config_path = DATA_ROOT / model_entry.config
+    with open(config_path) as f:
+        from ml_collections import ConfigDict
+        config = ConfigDict(yaml.safe_load(f))
+
+    model = get_model_from_config("mel_band_roformer", config)
+    ckpt_path = DATA_ROOT / model_entry.checkpoint
+    state_dict = torch.load(str(ckpt_path), map_location="cpu")
     if "state" in state_dict:
         state_dict = state_dict["state"]
     model.load_state_dict(state_dict, strict=False)
@@ -115,13 +122,16 @@ def separate_roformer(
     model = model.to(device)
 
     mix = _load_audio_universal(input_path, sr=44100)
-    separated = demix(config, model, mix, device, model_type="mel_band_roformer", pbar=False)
-    instruments = prefer_target_instrument(config)
-    target_key = instruments[0] if instruments else list(separated.keys())[0]
+    mixture = torch.tensor(mix, dtype=torch.float32)
+    res, _ = demix_track(config, model, mixture, device)
 
-    sf.write(str(vocals_out), separated[target_key].T, 44100, subtype="PCM_16")
+    instruments = list(res.keys())
+    target_key = config.training.target_instrument if hasattr(config.training, "target_instrument") and config.training.target_instrument else instruments[0]
 
-    instrumental = mix - separated[target_key]
+    vocals = res[target_key]
+    sf.write(str(vocals_out), vocals.T, 44100, subtype="PCM_16")
+
+    instrumental = mix - vocals
     sf.write(str(instrumental_out), instrumental.T, 44100, subtype="PCM_16")
 
     logger.info("Roformer separation complete: %s", input_path.name)

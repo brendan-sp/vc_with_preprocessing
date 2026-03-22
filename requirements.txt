@@ -7,7 +7,9 @@ torchaudio
 pedalboard
 crepe
 demucs
-roformer-separation
+melband-roformer-infer
+ml-collections
+pyyaml
 rvc
 boto3
 tqdm

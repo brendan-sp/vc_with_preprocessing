@@ -1,35 +1,40 @@
 #!/usr/bin/env python3
 """RVC voice conversion for individual vocal segments.
 
-Mirrors the RVC inference logic from aws_batch_interface/jobs/rvc/worker.py
-but operates on local files rather than S3.  Supports both the ``rvc`` CLI
-and direct Python API.
+Uses the RVC Python API directly for inference, avoiding CLI subprocess
+issues with torch.load weights_only defaults in PyTorch >= 2.6.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
 import os
-import shutil
-import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
+import torch
+
 logger = logging.getLogger(__name__)
 
+_TORCH_LOAD_PATCHED = False
 
-def _find_rvc_binary() -> str:
-    """Locate the ``rvc`` CLI binary, preferring the same env as the running interpreter."""
-    exe_dir = Path(sys.executable).parent
-    candidate = exe_dir / "rvc"
-    if candidate.exists():
-        return str(candidate)
-    found = shutil.which("rvc")
-    if found:
-        return found
-    return "rvc"
+
+def _patch_torch_load():
+    """Patch torch.load to default to weights_only=False for fairseq compat."""
+    global _TORCH_LOAD_PATCHED
+    if _TORCH_LOAD_PATCHED:
+        return
+    _original_load = torch.load
+
+    def _patched_load(*args, **kwargs):
+        if "weights_only" not in kwargs:
+            kwargs["weights_only"] = False
+        return _original_load(*args, **kwargs)
+
+    torch.load = _patched_load
+    _TORCH_LOAD_PATCHED = True
 
 
 def _default_rvc_assets_root() -> Path:
@@ -40,6 +45,28 @@ def _default_rvc_assets_root() -> Path:
 
 
 RVC_ASSETS_ROOT = _default_rvc_assets_root()
+
+_vc_instance = None
+
+
+def _get_vc(pth_path: Path, index_path: Optional[Path] = None):
+    """Get or reuse a VC instance loaded with the given checkpoint."""
+    global _vc_instance
+    _patch_torch_load()
+
+    os.environ.setdefault("index_root", str(RVC_ASSETS_ROOT / "logs"))
+    os.environ.setdefault("weight_root", str(RVC_ASSETS_ROOT / "weights"))
+    os.environ.setdefault("hubert_path", str(RVC_ASSETS_ROOT / "assets" / "hubert" / "hubert_base.pt"))
+    os.environ.setdefault("rmvpe_root", str(RVC_ASSETS_ROOT / "assets" / "rmvpe"))
+
+    from rvc.modules.vc.modules import VC
+
+    if _vc_instance is None or getattr(_vc_instance, "_loaded_pth", None) != str(pth_path):
+        _vc_instance = VC()
+        _vc_instance.get_vc(str(pth_path))
+        _vc_instance._loaded_pth = str(pth_path)
+
+    return _vc_instance
 
 
 def md5_of_file(path: Path) -> str:
@@ -54,60 +81,38 @@ def md5_of_string(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
 
-def run_rvc_cli(
+def run_rvc_infer(
     pth_path: Path,
     input_wav: Path,
     output_wav: Path,
     index_path: Optional[Path] = None,
     f0_up_key: int = 0,
     f0_method: str = "rmvpe",
-    timeout: int = 600,
 ) -> bool:
-    """Run the ``rvc infer`` CLI subprocess.
+    """Run RVC inference using the Python API directly."""
+    try:
+        vc = _get_vc(pth_path, index_path)
+        tgt_sr, audio_opt, times, _ = vc.vc_inference(
+            sid=0,
+            input_audio_path=str(input_wav),
+            f0_up_key=f0_up_key,
+            f0_method=f0_method,
+            index_file=str(index_path) if index_path and index_path.exists() else None,
+            hubert_path=os.environ.get("hubert_path"),
+        )
+        if audio_opt is None:
+            logger.warning("RVC returned None audio for %s", input_wav.name)
+            return False
 
-    The RVC library strips directory info from Path inputs (it calls
-    ``.name`` on Path objects), so we must pass only the filename and
-    set ``cwd`` to the file's parent directory.
-    """
-    rvc_bin = _find_rvc_binary()
-    cmd = [
-        rvc_bin, "infer",
-        "-m", str(pth_path),
-        "-i", input_wav.name,
-        "-o", str(output_wav),
-    ]
-    if f0_up_key != 0:
-        cmd.extend(["-fu", str(f0_up_key)])
-    if index_path and index_path.exists():
-        cmd.extend(["-if", str(index_path)])
-
-    root = RVC_ASSETS_ROOT
-    env = os.environ.copy()
-    env.update({
-        "index_root": str(root / "logs"),
-        "weight_root": str(root / "weights"),
-        "hubert_path": str(root / "assets" / "hubert" / "hubert_base.pt"),
-        "rmvpe_path": str(root / "assets" / "rmvpe" / "rmvpe.pt"),
-        "rmvpe_root": str(root / "assets" / "rmvpe"),
-    })
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-        env=env,
-        cwd=str(input_wav.parent),
-    )
-    if result.returncode != 0:
-        for line in (result.stderr or "").strip().splitlines()[-10:]:
-            logger.warning("RVC stderr: %s", line)
+        from scipy.io import wavfile
+        wavfile.write(str(output_wav), tgt_sr, audio_opt)
+        if not output_wav.exists() or output_wav.stat().st_size < 1000:
+            logger.warning("RVC output missing or too small: %s", output_wav)
+            return False
+        return True
+    except Exception as e:
+        logger.warning("RVC inference failed for %s: %s", input_wav.name, e)
         return False
-    if not output_wav.exists() or output_wav.stat().st_size < 1000:
-        logger.warning("RVC output missing or too small: %s", output_wav)
-        return False
-    return True
 
 
 def convert_segments(
@@ -128,7 +133,7 @@ def convert_segments(
 
     for seg_path in segment_paths:
         out_path = output_dir / seg_path.name
-        ok = run_rvc_cli(
+        ok = run_rvc_infer(
             pth_path, seg_path, out_path,
             index_path=index_path,
             f0_up_key=f0_up_key,

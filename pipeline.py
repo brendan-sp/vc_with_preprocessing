@@ -17,11 +17,9 @@ For each input audio track this pipeline:
   6. (Optional) **Noise evaluation** flags outputs whose HNR or CREPE
      confidence fall below quality thresholds.
 
-Output naming convention:
-    source_{audio_md5}_rvcmodel_{rvc_md5}.wav
-
-The timestamps CSV and a per-track metadata JSON are saved in a
-subdirectory with the same stem name.
+All outputs for a given track are placed in a single directory:
+    {output_root}/source_{audio_md5}_rvcmodel_{rvc_md5}/
+containing the final wav, timestamps CSV, and per-track metadata JSON.
 """
 from __future__ import annotations
 
@@ -100,7 +98,7 @@ def process_track(
 
     stem = _output_stem(source_md5, rvc_md5)
     output_dir = output_root / stem
-    final_wav = output_root / f"{stem}.wav"
+    final_wav = output_dir / f"{stem}.wav"
 
     if final_wav.exists():
         logger.info("Already processed, skipping: %s", final_wav.name)
@@ -219,10 +217,10 @@ def process_track(
 
 
 def upload_to_s3(local_output_root: Path, stem: str, s3_dest: str) -> List[str]:
-    """Upload the final wav, timestamps CSV, and metadata to S3.
+    """Upload all files in the ``{stem}/`` directory to S3.
 
     Args:
-        local_output_root: directory containing ``{stem}.wav`` and ``{stem}/``.
+        local_output_root: parent directory containing the ``{stem}/`` folder.
         stem: the ``source_{md5}_rvcmodel_{md5}`` name.
         s3_dest: S3 URI prefix, e.g. ``s3://bucket/prefix/``.
 
@@ -241,17 +239,11 @@ def upload_to_s3(local_output_root: Path, stem: str, s3_dest: str) -> List[str]:
 
     uploaded: List[str] = []
 
-    wav_path = local_output_root / f"{stem}.wav"
-    if wav_path.exists():
-        key = f"{prefix}/{stem}.wav" if prefix else f"{stem}.wav"
-        _s3.upload_file(str(wav_path), bucket, key)
-        uri = f"s3://{bucket}/{key}"
-        uploaded.append(uri)
-        logger.info("Uploaded %s -> %s", wav_path.name, uri)
-
     subdir = local_output_root / stem
     if subdir.is_dir():
         for f in subdir.iterdir():
+            if not f.is_file():
+                continue
             key = f"{prefix}/{stem}/{f.name}" if prefix else f"{stem}/{f.name}"
             _s3.upload_file(str(f), bucket, key)
             uri = f"s3://{bucket}/{key}"
