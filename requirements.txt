@@ -17,3 +17,6 @@ torchcrepe
 rvc
 boto3
 tqdm
+# NOTE: fairseq 0.12.2 (pulled by rvc) has a dataclass bug on Python 3.11+.
+# Install the patched fork manually after pip install -r requirements.txt:
+#   pip install git+https://github.com/One-sixth/fairseq.git --no-deps

@@ -24,7 +24,33 @@ Input audio
   └─ 6. Noise evaluation ── optional HNR / CREPE quality gate
 ```
 
-## EC2 setup
+## Environment setup
+
+### Local (macOS / Linux)
+
+```bash
+# Create a dedicated conda environment (Python 3.11 recommended)
+conda create -n vc_preproc python=3.11 -y
+conda activate vc_preproc
+
+# Install av + ffmpeg via conda (avoids C compilation issues)
+conda install -c conda-forge av ffmpeg -y
+
+# Install PyTorch
+pip install torch torchaudio torchcodec
+
+# Install remaining dependencies
+pip install -r requirements.txt
+
+# fairseq 0.12.2 has a known dataclass bug with Python 3.11+.
+# Install a patched fork instead:
+pip install git+https://github.com/One-sixth/fairseq.git --no-deps
+
+# macOS: if you see OpenMP duplicate-library errors, set:
+export KMP_DUPLICATE_LIB_OK=TRUE
+```
+
+### EC2 (GPU)
 
 Recommended instance: **g4dn.xlarge** (T4 GPU, 16 GB VRAM) or larger.
 CPU-only instances work but separation and dereverberation will be 10–20x
@@ -35,15 +61,20 @@ slower.
 sudo apt-get update && sudo apt-get install -y ffmpeg
 
 # Python environment
-python3 -m venv venv && source venv/bin/activate
+conda create -n vc_preproc python=3.11 -y
+conda activate vc_preproc
+conda install -c conda-forge av ffmpeg -y
 
-# For GPU instances, install PyTorch with CUDA first:
+# Install PyTorch with CUDA:
 pip install torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cu121
 
-# Then install the rest:
+# Install the rest:
 pip install -r requirements.txt
 
-# For GPU ONNX acceleration (used by audio-separator):
+# Patched fairseq for Python 3.11+:
+pip install git+https://github.com/One-sixth/fairseq.git --no-deps
+
+# GPU ONNX acceleration (used by audio-separator):
 pip install onnxruntime-gpu
 ```
 
