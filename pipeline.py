@@ -35,7 +35,14 @@ from typing import List, Optional
 from pydub import AudioSegment
 
 from separation import SeparationBackend, separate
-from dereverberation import DEREVERB_PROBABILITY, Dereverberation, maybe_dereverb
+from dereverberation import (
+    DEREVERB_PROBABILITY,
+    Dereverberation,
+    DereverbMelBandRoformer,
+    maybe_dereverb,
+)
+
+_DEREVERB_CLASSES = {"vrnet": Dereverberation, "mbr": DereverbMelBandRoformer}
 from desilence import desilence_and_track, reassemble_from_segments, VocalSegment
 from rvc_convert import (
     convert_segments,
@@ -253,14 +260,23 @@ def upload_to_s3(local_output_root: Path, stem: str, s3_dest: str) -> List[str]:
     return uploaded
 
 
+def _make_dereverb(backend: Optional[str], device: str = "cuda"):
+    """Create and load a dereverberation model, or return None to skip."""
+    cls = _DEREVERB_CLASSES.get(backend)
+    if cls is None:
+        return None
+    m = cls(device=device)
+    m.load()
+    return m
+
+
 def process_batch(
     input_dir: Path,
     checkpoint_dir: Path,
     output_root: Path,
     *,
     glob_pattern: str = "*.wav",
-    dereverb_model_path: Optional[str] = None,
-    dereverb_params_path: Optional[str] = None,
+    dereverb_backend: Optional[str] = None,
     dereverb_device: str = "cuda",
     **kwargs,
 ) -> List[dict]:
@@ -273,14 +289,7 @@ def process_batch(
     output_root.mkdir(parents=True, exist_ok=True)
     logger.info("Processing %d tracks from %s", len(audio_files), input_dir)
 
-    dereverb = None
-    if dereverb_model_path and dereverb_params_path:
-        dereverb = Dereverberation(
-            model_path=dereverb_model_path,
-            params_path=dereverb_params_path,
-            device=dereverb_device,
-        )
-        dereverb.load()
+    dereverb = _make_dereverb(dereverb_backend, dereverb_device)
 
     results = []
     for audio_path in audio_files:
@@ -372,15 +381,14 @@ if __name__ == "__main__":
     p.add_argument("--s3-dest", default=None, help="S3 URI prefix to upload outputs (e.g. s3://bucket/prefix/)")
 
     sep_group = p.add_argument_group("separation")
-    sep_group.add_argument("--sep-backend", choices=["demucs", "roformer"], default=None,
-                           help="Force separation backend (default: random)")
+    sep_group.add_argument("--sep-backend", choices=["demucs", "roformer", "mdxchain", "uvr5"],
+                           default=None, help="Force separation backend (default: random)")
     sep_group.add_argument("--device", default=None, help="Torch device (default: auto)")
 
     dereverb_group = p.add_argument_group("dereverberation")
-    dereverb_group.add_argument("--dereverb-model-path", default=None,
-                                help="Path to VR-DeEchoDeReverb.pth (omit to skip dereverberation)")
-    dereverb_group.add_argument("--dereverb-params-path", default=None,
-                                help="Path to 4band_v3.json params file")
+    dereverb_group.add_argument("--dereverb-backend", choices=["vrnet", "mbr"], default=None,
+                                help="Dereverb backend: vrnet (UVR5 VR-Net) or mbr "
+                                     "(MelBandRoformer). Omit to skip dereverberation.")
     dereverb_group.add_argument("--dereverb-device", default="cuda")
     dereverb_group.add_argument("--dereverb-probability", type=float, default=DEREVERB_PROBABILITY)
 
@@ -448,15 +456,7 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if input_file:
-        dereverb = None
-        if args.dereverb_model_path and args.dereverb_params_path:
-            dereverb = Dereverberation(
-                model_path=args.dereverb_model_path,
-                params_path=args.dereverb_params_path,
-                device=args.dereverb_device,
-            )
-            dereverb.load()
-
+        dereverb = _make_dereverb(args.dereverb_backend, args.dereverb_device)
         result = process_track(
             input_file, checkpoint_dir, output_dir,
             dereverb_model=dereverb,
@@ -469,8 +469,7 @@ if __name__ == "__main__":
             checkpoint_dir=checkpoint_dir,
             output_root=output_dir,
             glob_pattern=args.glob,
-            dereverb_model_path=args.dereverb_model_path,
-            dereverb_params_path=args.dereverb_params_path,
+            dereverb_backend=args.dereverb_backend,
             dereverb_device=args.dereverb_device,
             **common_kwargs,
         )

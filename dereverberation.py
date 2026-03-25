@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Dereverberation using UVR5 VR-DeEchoDeReverb, applied stochastically.
+"""Dereverberation with selectable backends, applied stochastically.
 
-In the SVDD pipeline, dereverberation is applied 53% of the time so
-the detection model sees a mixture of reverberant and dry vocals.  The
-implementation mirrors the APCleaner from audiotools/ml/cleaning/rvc.py.
+Two backends are supported:
+
+  * **vrnet** – UVR5 VR-DeEchoDeReverb (VR-Net architecture via audio-separator).
+  * **mbr** – MelBandRoformer de-reverb via audio-separator.
+
+Both backends auto-download model weights on first use.
+
+In the SVDD pipeline, dereverberation is applied 53 % of the time so
+the detection model sees a mixture of reverberant and dry vocals.
 """
 from __future__ import annotations
 
 import logging
 import os
-import random
-import time
+import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
 
-import librosa
 import numpy as np
 import soundfile as sf
 from pedalboard import Pedalboard, NoiseGate
@@ -22,95 +26,140 @@ from pedalboard import Pedalboard, NoiseGate
 logger = logging.getLogger(__name__)
 
 DEREVERB_PROBABILITY = 0.53
+MODELS_DIR = Path(__file__).parent / "models" / "audio-separator"
 
-SCRIPTDIR = os.path.dirname(os.path.realpath(__file__))
+
+def _find_dereverb_stem(files: list, output_dir: str, *keywords: str) -> str:
+    """Find the de-reverbed output file by keyword match."""
+    for f in files:
+        name = Path(f).name.lower()
+        if any(k.lower() in name for k in keywords):
+            p = Path(f)
+            if not p.exists() and output_dir:
+                p = Path(output_dir) / p.name
+            return str(p)
+    raise FileNotFoundError(
+        f"No dereverb stem matching {keywords} in {files}"
+    )
+
+
+def _make_separator(output_dir: str):
+    from audio_separator.separator import Separator
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    return Separator(
+        output_dir=output_dir,
+        output_format="WAV",
+        model_file_dir=str(MODELS_DIR),
+    )
 
 
 class Dereverberation:
-    """UVR5 DeEcho/DeReverb wrapper with noise-gate post-processing."""
+    """UVR5 VR-Net dereverberation via audio-separator.
 
-    def __init__(self, model_path: str, params_path: str, device: str = "cuda", agg: int = 4):
-        self.model_path = model_path
-        self.params_path = params_path
+    Uses UVR-DeEcho-DeReverb.pth (CascadedNet with LSTM).
+    Model is downloaded automatically on first use.
+    """
+
+    MODEL_FILENAME = "UVR-DeEcho-DeReverb.pth"
+
+    def __init__(self, device: str = "cuda", agg: int = 5):
         self.device = device
         self.agg = agg
-        self.model = None
         self.board = Pedalboard([NoiseGate(threshold_db=-40)])
+        self._separator = None
+        self._output_dir = None
 
     def load(self):
-        from audiotools.ml.cleaning.ext.rvc.infer.modules.uvr5.preprocess import AudioPreDeEcho
-        self.model = AudioPreDeEcho(
-            agg=self.agg,
-            model_path=self.model_path,
-            device=self.device,
-            is_half=True,
-            tta=False,
-            params_path=self.params_path,
-        )
-        logger.info("Loaded DeReverb model from %s", self.model_path)
+        self._output_dir = tempfile.mkdtemp(prefix="dereverb_vr_")
+        self._separator = _make_separator(self._output_dir)
+        self._separator.load_model(model_filename=self.MODEL_FILENAME)
+        logger.info("Loaded VR-Net dereverb model: %s", self.MODEL_FILENAME)
 
     def process(self, wav: np.ndarray, sr: int) -> Tuple[np.ndarray, int]:
-        """Dereverberate audio.
-
-        Args:
-            wav: (samples,) or (samples, channels) array.
-            sr: sample rate (will be resampled to 44100 internally).
-
-        Returns:
-            (dereverberated_wav, sr) with noise-gate applied.
-        """
-        if self.model is None:
+        if self._separator is None:
             self.load()
 
-        input_len = wav.shape[0] if wav.ndim == 1 else wav.shape[0]
-        sr_orig = sr
-        sr_trg = 44100
+        tmp_in = os.path.join(self._output_dir, "_dereverb_input.wav")
+        sf.write(tmp_in, wav, sr, subtype="PCM_16")
 
-        if wav.ndim == 1:
-            wav = wav[:, np.newaxis]
-            wav = np.repeat(wav, 2, axis=1)
+        output_files = self._separator.separate(tmp_in)
+        logger.info("VR-Net dereverb outputs: %s", output_files)
 
-        if sr_orig != sr_trg:
-            wav = librosa.resample(wav.T, orig_sr=sr_orig, target_sr=sr_trg, res_type="soxr_hq").T
-            sr = sr_trg
+        stem = _find_dereverb_stem(
+            output_files, self._output_dir,
+            "(No Reverb)", "no_reverb", "noreverb",
+        )
+        wav_out, sr_out = sf.read(stem)
+        os.unlink(tmp_in)
 
-        nb_retry = 3
-        for attempt in range(nb_retry):
-            try:
-                wav_dereverb, _, sr = self.model._path_audio_(wav.T, sr)
-                if np.isnan(wav_dereverb).any():
-                    logger.warning("NaN values in dereverberated audio, retrying...")
-                    raise ValueError("NaN in output")
-                break
-            except Exception as e:
-                logger.warning("Dereverb attempt %d failed: %s", attempt + 1, e)
-                if attempt == nb_retry - 1:
-                    raise
-                time.sleep(1.0)
+        input_len = wav.shape[0]
+        if wav_out.shape[0] > input_len:
+            wav_out = wav_out[:input_len]
+        elif wav_out.shape[0] < input_len:
+            pad = [(0, input_len - wav_out.shape[0])]
+            if wav_out.ndim == 2:
+                pad.append((0, 0))
+            wav_out = np.pad(wav_out, pad)
 
-        if sr_orig != sr_trg:
-            wav_dereverb = librosa.resample(
-                wav_dereverb.T, orig_sr=sr_trg, target_sr=sr_orig, res_type="soxr_hq"
-            ).T
-            sr = sr_orig
+        wav_out = self.board(wav_out, sample_rate=sr_out)
+        return wav_out, sr_out
 
-        if wav_dereverb.shape[0] != input_len:
-            if wav_dereverb.shape[0] > input_len:
-                wav_dereverb = wav_dereverb[:input_len]
-            else:
-                wav_dereverb = np.pad(
-                    wav_dereverb,
-                    ((0, input_len - wav_dereverb.shape[0]), (0, 0)),
-                )
 
-        wav_out = self.board(wav_dereverb, sample_rate=sr)
-        return wav_out, sr
+class DereverbMelBandRoformer:
+    """MelBandRoformer dereverberation via audio-separator.
+
+    Uses the anvuew de-reverb checkpoint (SDR 19.17).
+    Model is downloaded automatically on first use.
+    """
+
+    MODEL_FILENAME = "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt"
+
+    def __init__(self, device: str = "cuda"):
+        self.device = device
+        self.board = Pedalboard([NoiseGate(threshold_db=-40)])
+        self._separator = None
+        self._output_dir = None
+
+    def load(self):
+        self._output_dir = tempfile.mkdtemp(prefix="dereverb_mbr_")
+        self._separator = _make_separator(self._output_dir)
+        self._separator.load_model(model_filename=self.MODEL_FILENAME)
+        logger.info("Loaded MBR dereverb model: %s", self.MODEL_FILENAME)
+
+    def process(self, wav: np.ndarray, sr: int) -> Tuple[np.ndarray, int]:
+        if self._separator is None:
+            self.load()
+
+        tmp_in = os.path.join(self._output_dir, "_dereverb_input.wav")
+        sf.write(tmp_in, wav, sr, subtype="PCM_16")
+
+        output_files = self._separator.separate(tmp_in)
+        logger.info("MBR dereverb outputs: %s", output_files)
+
+        stem = _find_dereverb_stem(
+            output_files, self._output_dir,
+            "(noreverb)", "no_reverb", "(dry)", "(No Reverb)",
+        )
+        wav_out, sr_out = sf.read(stem)
+        os.unlink(tmp_in)
+
+        input_len = wav.shape[0]
+        if wav_out.shape[0] > input_len:
+            wav_out = wav_out[:input_len]
+        elif wav_out.shape[0] < input_len:
+            pad = [(0, input_len - wav_out.shape[0])]
+            if wav_out.ndim == 2:
+                pad.append((0, 0))
+            wav_out = np.pad(wav_out, pad)
+
+        wav_out = self.board(wav_out, sample_rate=sr_out)
+        return wav_out, sr_out
 
 
 def maybe_dereverb(
     vocals_path: Path,
     output_path: Path,
-    dereverb_model: Optional[Dereverberation] = None,
+    dereverb_model=None,
     probability: float = DEREVERB_PROBABILITY,
     force: Optional[bool] = None,
 ) -> Tuple[Path, bool]:
@@ -119,19 +168,19 @@ def maybe_dereverb(
     Args:
         vocals_path: input vocal wav.
         output_path: where to write (possibly dereverberated) output.
-        dereverb_model: pre-loaded Dereverberation instance (lazy-loaded if None
-                        and dereverberation is triggered).
+        dereverb_model: a loaded Dereverberation or DereverbMelBandRoformer.
         probability: chance of applying dereverb (default 0.53).
         force: if True always apply, if False never apply, None = stochastic.
 
     Returns:
         (output_path, was_applied).
     """
+    import random, shutil
+
     apply = force if force is not None else (random.random() < probability)
 
     if not apply:
         if vocals_path != output_path:
-            import shutil
             shutil.copy2(vocals_path, output_path)
         logger.info("Dereverberation skipped (p=%.2f) for %s", probability, vocals_path.name)
         return output_path, False
@@ -139,12 +188,13 @@ def maybe_dereverb(
     if dereverb_model is None:
         raise RuntimeError(
             "Dereverberation was selected but no model instance was provided. "
-            "Pass a Dereverberation object or set force=False."
+            "Pass --dereverb-backend to enable dereverberation."
         )
 
+    import librosa
     wav, sr = librosa.load(str(vocals_path), sr=None, mono=False)
     if wav.ndim == 2:
-        wav = wav.T  # (channels, samples) -> (samples, channels)
+        wav = wav.T
 
     wav_out, sr_out = dereverb_model.process(wav, sr)
 
@@ -163,16 +213,14 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Apply dereverberation to vocals")
     p.add_argument("input", type=Path)
     p.add_argument("--output", type=Path, default=None)
-    p.add_argument("--model-path", required=True, help="Path to VR-DeEchoDeReverb.pth")
-    p.add_argument(
-        "--params-path", required=True,
-        help="Path to 4band_v3.json model params",
-    )
+    p.add_argument("--backend", choices=["vrnet", "mbr"], default="mbr",
+                   help="Dereverb backend (default: mbr)")
     p.add_argument("--force", action="store_true", help="Always apply (ignore probability)")
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
 
     out = args.output or args.input.parent / f"{args.input.stem}_dereverb.wav"
-    model = Dereverberation(args.model_path, args.params_path, device=args.device)
+    model = DereverbMelBandRoformer(device=args.device) if args.backend == "mbr" \
+        else Dereverberation(device=args.device)
     model.load()
-    maybe_dereverb(out, out, dereverb_model=model, force=args.force or None)
+    maybe_dereverb(args.input, out, dereverb_model=model, force=args.force or None)
