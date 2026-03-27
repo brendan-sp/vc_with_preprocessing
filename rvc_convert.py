@@ -91,6 +91,14 @@ def md5_of_string(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
 
+def _is_mps_active() -> bool:
+    """Check whether the RVC model is running on MPS (Apple Silicon GPU)."""
+    try:
+        return torch.backends.mps.is_available()
+    except Exception:
+        return False
+
+
 def run_rvc_infer(
     pth_path: Path,
     input_wav: Path,
@@ -103,6 +111,15 @@ def run_rvc_infer(
     try:
         vc = _get_vc(pth_path, index_path)
         index_str = str(index_path) if index_path and index_path.exists() else ""
+
+        if index_str and _is_mps_active():
+            logger.warning(
+                "Skipping FAISS index on MPS — faiss.read_index inside the "
+                "RVC pipeline causes a segfault when MPS is active. "
+                "Inference will proceed without the index (slight quality reduction)."
+            )
+            index_str = ""
+
         tgt_sr, audio_opt, times, _ = vc.vc_single(
             sid=0,
             input_audio_path=str(input_wav),
@@ -175,12 +192,40 @@ def convert_segments(
     return converted
 
 
+def _validate_faiss_index(index_path: Path) -> bool:
+    """Try loading a FAISS index to check it's compatible with the installed version."""
+    try:
+        import faiss
+        index = faiss.read_index(str(index_path))
+        logger.info(
+            "FAISS index OK: %s (ntotal=%d, d=%d)",
+            index_path.name, index.ntotal, index.d,
+        )
+        if _is_mps_active():
+            logger.warning(
+                "MPS detected — FAISS index will be skipped during RVC "
+                "inference to avoid a known segfault"
+            )
+        return True
+    except Exception as e:
+        logger.warning("FAISS index failed to load: %s — %s", index_path.name, e)
+        return False
+
+
 def find_checkpoint_files(
     checkpoint_dir: Path,
 ) -> tuple[List[Path], Optional[Path]]:
     """Find .pth and .index files in a local checkpoint directory.
 
     Returns (pth_candidates, best_index_path).
+
+    Index selection priority:
+      1. Files starting with ``added_`` (contain training vectors for inference)
+      2. Any other ``.index`` file
+      3. ``None`` if no valid index is found
+
+    Each candidate is validated with FAISS before selection; incompatible
+    indices are skipped with a warning.
     """
     pth_files = sorted(checkpoint_dir.glob("*.pth"), key=lambda p: p.name)
     excluded = ("._D_", "._G_", "_D_", "_G_", "D_", "G_")
@@ -192,8 +237,31 @@ def find_checkpoint_files(
         inference_pth = [p for p in pth_files if "D_" not in p.name]
 
     index_files = sorted(checkpoint_dir.glob("*.index"), key=lambda p: p.name)
-    preferred = [p for p in index_files if p.name.startswith("added")]
-    best_index = preferred[0] if preferred else (index_files[0] if index_files else None)
+    preferred = [p for p in index_files if p.name.startswith("added_")]
+    others = [p for p in index_files if not p.name.startswith("added_")]
+    candidates = preferred + others
+
+    if candidates:
+        logger.info(
+            "Found %d index file(s) in %s: %s",
+            len(candidates), checkpoint_dir.name,
+            ", ".join(p.name for p in candidates),
+        )
+
+    best_index = None
+    for idx_path in candidates:
+        if _validate_faiss_index(idx_path):
+            best_index = idx_path
+            break
+        logger.warning("Skipping unusable index: %s", idx_path.name)
+
+    if candidates and best_index is None:
+        logger.warning(
+            "No usable FAISS index found — RVC will run without index "
+            "(quality may be reduced)"
+        )
+    elif best_index is not None:
+        logger.info("Selected index: %s", best_index.name)
 
     return inference_pth, best_index
 
